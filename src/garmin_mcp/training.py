@@ -5,7 +5,12 @@ Training and performance functions for Garmin Connect MCP Server
 import json
 import datetime
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from garminconnect import (
+    GarminConnectAuthenticationError,
+    GarminConnectTooManyRequestsError,
+)
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -107,6 +112,231 @@ def _extract_dated_vo2_measurements(data: Any) -> Dict[str, Dict[str, float]]:
 
     collect(data)
     return by_date
+
+
+def _classify_garmin_failure(exc: BaseException) -> str:
+    """Map a Garmin client error to an explicit trend-failure kind.
+
+    Absence of data is not a failure — callers record that as coverage.missing.
+    """
+    if isinstance(exc, GarminConnectAuthenticationError):
+        return "authentication"
+    if isinstance(exc, GarminConnectTooManyRequestsError):
+        return "rate_limit"
+    return "connection"
+
+
+def _trend_coverage(
+    days_requested: int,
+    available_dates: Set[str],
+    failed_dates: Set[str],
+    stale_dates: Optional[Set[str]] = None,
+) -> Dict[str, int]:
+    """Requested/available/missing/failed/stale counts for a daily trend window."""
+    available = len(available_dates)
+    failed = len(failed_dates)
+    stale = len(stale_dates or set())
+    return {
+        "requested": days_requested,
+        "available": available,
+        "missing": days_requested - available - failed - stale,
+        "failed": failed,
+        "stale": stale,
+    }
+
+
+def _parse_trend_window(
+    start_date: str, end_date: str, max_days: int
+) -> Union[str, Tuple[datetime.date, datetime.date, int]]:
+    """Validate a trend date range or return the tool error string."""
+    try:
+        start = datetime.date.fromisoformat(start_date)
+        end = datetime.date.fromisoformat(end_date)
+    except ValueError as e:
+        return f"Invalid date format: {e}. Use YYYY-MM-DD."
+
+    days = (end - start).days + 1
+    if days > max_days:
+        return f"Date range too large ({days} days). Maximum is {max_days} days."
+    if days < 1:
+        return "end_date must be on or after start_date."
+    return start, end, days
+
+
+def _date_belongs_to_request(observed: Any, requested: str) -> bool:
+    """True when an observation may represent the requested day.
+
+    A missing calendarDate does not prove a mismatch. A different calendarDate
+    is a stale observation and must not be labeled as the requested day.
+    """
+    if not isinstance(observed, str) or not observed:
+        return True
+    return observed == requested
+
+
+def _stale_observation(
+    requested_date: str,
+    observed: Any,
+    device_id: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    """Describe a payload dated to another day, or None if it may represent requested_date."""
+    if _date_belongs_to_request(observed, requested_date):
+        return None
+    item = {
+        "requested_date": requested_date,
+        "observed_date": str(observed),
+    }
+    if device_id:
+        item["device_id"] = device_id
+    return item
+
+
+def _device_id_of(device_key: Any, status_data: Dict[str, Any]) -> Optional[str]:
+    device_id = status_data.get("deviceId")
+    if device_id is None:
+        device_id = device_key
+    if device_id is None:
+        return None
+    return str(device_id)
+
+
+def _select_primary_device(
+    latest_data: Any,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Prefer primaryTrainingDevice; otherwise the first device dict in the map."""
+    mapping = latest_data if isinstance(latest_data, dict) else {}
+    fallback_key: Any = None
+    fallback: Dict[str, Any] = {}
+    for device_key, dev_data in mapping.items():
+        if not isinstance(dev_data, dict):
+            continue
+        if fallback_key is None:
+            fallback_key, fallback = device_key, dev_data
+        if dev_data.get("primaryTrainingDevice"):
+            return _device_id_of(device_key, dev_data), dev_data
+    if fallback_key is None:
+        return None, {}
+    return _device_id_of(fallback_key, fallback), fallback
+
+
+def _vo2_observed_date(data: Any, sport: str) -> Optional[str]:
+    """calendarDate for a sport's VO2 sample, if Garmin provided one."""
+    payload = _as_dict(data)
+    section_name = "generic" if sport == "running" else "cycling"
+    candidates = (
+        _as_dict(_as_dict(payload.get("mostRecentVO2Max")).get(section_name)).get(
+            "calendarDate"
+        ),
+        _as_dict(payload.get(section_name)).get("calendarDate"),
+        payload.get("calendarDate"),
+    )
+    for value in candidates:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _vo2_measurements_for_date(data: Any, requested_date: str) -> Dict[str, float]:
+    """VO2 samples that belong to requested_date; stale dated points are omitted."""
+    dated = _extract_dated_vo2_measurements(data)
+    if requested_date in dated:
+        return dated[requested_date]
+    if dated:
+        return {}
+
+    measurements: Dict[str, float] = {}
+    for sport, value in _extract_vo2_measurements(data).items():
+        if _date_belongs_to_request(_vo2_observed_date(data, sport), requested_date):
+            measurements[sport] = value
+    return measurements
+
+
+def _call_for_day(fetch: Any, date_str: str) -> Tuple[str, Any]:
+    """Fetch one day: ("ok", payload), ("missing", None), or ("failed", kind)."""
+    try:
+        data = fetch(date_str)
+    except Exception as exc:
+        return "failed", _classify_garmin_failure(exc)
+    if not data:
+        return "missing", None
+    return "ok", data
+
+
+def _trend_envelope(
+    start_date: str,
+    end_date: str,
+    days: int,
+    available_dates: Set[str],
+    failures: List[Dict[str, str]],
+    extra: Dict[str, Any],
+    stale: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    stale_items = stale or []
+    payload: Dict[str, Any] = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "coverage": _trend_coverage(
+            days,
+            available_dates,
+            {item["date"] for item in failures},
+            {item["requested_date"] for item in stale_items},
+        ),
+        "failures": failures,
+        "stale": stale_items,
+    }
+    payload.update(extra)
+    return json.dumps(payload, indent=2)
+
+
+def _training_load_entry(
+    date_str: str,
+    status_data: Dict[str, Any],
+    vo2_data: Dict[str, Any],
+    device_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Curate one CTL/ATL day. Returns None when the selected device has no metrics."""
+    entry: Dict[str, Any] = {"date": date_str}
+    atl_dto = status_data.get("acuteTrainingLoadDTO") or {}
+    atl = atl_dto.get("dailyTrainingLoadAcute")
+    ctl = atl_dto.get("dailyTrainingLoadChronic")
+    acwr = atl_dto.get("dailyAcuteChronicWorkloadRatio")
+    if atl is not None:
+        entry["atl"] = round(atl, 1)
+    if ctl is not None:
+        entry["ctl"] = round(ctl, 1)
+    if atl is not None and ctl is not None:
+        entry["tsb"] = round(ctl - atl, 1)
+    if acwr is not None:
+        entry["acwr"] = round(acwr, 2)
+    acwr_status = atl_dto.get("acwrStatus")
+    if acwr_status:
+        entry["acwr_status"] = acwr_status
+    acwr_pct = atl_dto.get("acwrPercent")
+    if acwr_pct is not None:
+        entry["acwr_percent"] = acwr_pct
+    chronic_min = atl_dto.get("minTrainingLoadChronic")
+    if chronic_min is not None:
+        entry["optimal_chronic_load_min"] = round(chronic_min, 1)
+    chronic_max = atl_dto.get("maxTrainingLoadChronic")
+    if chronic_max is not None:
+        entry["optimal_chronic_load_max"] = round(chronic_max, 1)
+    ts_phrase = status_data.get("trainingStatusFeedbackPhrase")
+    if ts_phrase:
+        entry["training_status"] = ts_phrase
+    ts_code = status_data.get("trainingStatus")
+    if ts_code is not None:
+        entry["training_status_code"] = ts_code
+    fitness_trend = status_data.get("fitnessTrend")
+    if fitness_trend is not None:
+        entry["fitness_trend"] = fitness_trend
+    vo2 = vo2_data.get("vo2MaxValue")
+    if vo2 is not None:
+        entry["vo2_max"] = round(vo2, 1)
+    if len(entry) == 1:
+        return None
+    if device_id:
+        entry["device_id"] = device_id
+    return entry
 
 
 def _get_max_metrics_range(
@@ -815,6 +1045,12 @@ def register_tools(app):
         (ACWR) per day. Use this to assess whether the athlete is building fitness, peaking, or
         accumulating too much fatigue.
 
+        Coverage lists requested/available/missing/failed days. Failures are
+        classified as authentication, rate_limit, or connection. Missing days
+        stay missing — they are not filled with zero. Each point uses the
+        primary training device and only includes an observation whose
+        calendarDate matches the requested day.
+
         Recommended range: 4-8 weeks. Maximum: 90 days.
 
         Args:
@@ -822,97 +1058,53 @@ def register_tools(app):
             end_date: End date in YYYY-MM-DD format
         """
         MAX_DAYS = 90
-        try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
-
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+        window = _parse_trend_window(start_date, end_date, MAX_DAYS)
+        if isinstance(window, str):
+            return window
+        start, end, days = window
 
         trend = []
+        failures: List[Dict[str, str]] = []
+        stale: List[Dict[str, str]] = []
+        available_dates: Set[str] = set()
         current = start
         while current <= end:
             date_str = current.isoformat()
-            try:
-                data = garmin_client.get_training_status(date_str)
-                if data:
-                    # latestTrainingStatusData is a dict keyed by device ID, not
-                    # the DTO directly. Pick the primary training device when
-                    # available, fall back to the first device. Use `or {}` to
-                    # coalesce explicit nulls (Garmin returns None for sections
-                    # the user has no data in, which breaks chained `.get`).
-                    recent_status = data.get("mostRecentTrainingStatus") or {}
-                    latest_data = recent_status.get("latestTrainingStatusData") or {}
-                    status_data: Dict[str, Any] = {}
-                    for dev_data in latest_data.values():
-                        if not isinstance(dev_data, dict):
-                            continue
-                        if dev_data.get("primaryTrainingDevice"):
-                            status_data = dev_data
-                            break
-                        if not status_data:
-                            status_data = dev_data
-                    atl_dto = status_data.get("acuteTrainingLoadDTO") or {}
-                    most_recent_vo2 = data.get("mostRecentVO2Max") or {}
-                    vo2_data = most_recent_vo2.get("generic") or {}
-                    entry: Dict[str, Any] = {"date": date_str}
-                    atl = atl_dto.get("dailyTrainingLoadAcute")
-                    ctl = atl_dto.get("dailyTrainingLoadChronic")
-                    acwr = atl_dto.get("dailyAcuteChronicWorkloadRatio")
-                    if atl is not None:
-                        entry["atl"] = round(atl, 1)
-                    if ctl is not None:
-                        entry["ctl"] = round(ctl, 1)
-                    if atl is not None and ctl is not None:
-                        entry["tsb"] = round(ctl - atl, 1)
-                    if acwr is not None:
-                        entry["acwr"] = round(acwr, 2)
-                    acwr_status = atl_dto.get("acwrStatus")
-                    if acwr_status:
-                        entry["acwr_status"] = acwr_status
-                    acwr_pct = atl_dto.get("acwrPercent")
-                    if acwr_pct is not None:
-                        entry["acwr_percent"] = acwr_pct
-                    chronic_min = atl_dto.get("minTrainingLoadChronic")
-                    if chronic_min is not None:
-                        entry["optimal_chronic_load_min"] = round(chronic_min, 1)
-                    chronic_max = atl_dto.get("maxTrainingLoadChronic")
-                    if chronic_max is not None:
-                        entry["optimal_chronic_load_max"] = round(chronic_max, 1)
-                    # Device data now has training status fields flattened — no
-                    # longer wrapped in a trainingStatusDTO sub-object.
-                    ts_phrase = status_data.get("trainingStatusFeedbackPhrase")
-                    if ts_phrase:
-                        entry["training_status"] = ts_phrase
-                    ts_code = status_data.get("trainingStatus")
-                    if ts_code is not None:
-                        entry["training_status_code"] = ts_code
-                    fitness_trend = status_data.get("fitnessTrend")
-                    if fitness_trend is not None:
-                        entry["fitness_trend"] = fitness_trend
-                    vo2 = vo2_data.get("vo2MaxValue")
-                    if vo2 is not None:
-                        entry["vo2_max"] = round(vo2, 1)
-                    if len(entry) > 1:  # has more than just date
+            status, payload = _call_for_day(
+                garmin_client.get_training_status, date_str
+            )
+            if status == "failed":
+                failures.append({"date": date_str, "kind": payload})
+            elif status == "ok":
+                recent_status = payload.get("mostRecentTrainingStatus") or {}
+                latest_data = recent_status.get("latestTrainingStatusData") or {}
+                device_id, status_data = _select_primary_device(latest_data)
+                stale_item = _stale_observation(
+                    date_str, status_data.get("calendarDate"), device_id
+                )
+                if stale_item:
+                    stale.append(stale_item)
+                else:
+                    vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
+                        "generic"
+                    ) or {}
+                    entry = _training_load_entry(
+                        date_str, status_data, _as_dict(vo2_data), device_id
+                    )
+                    if entry is not None:
                         trend.append(entry)
-            except Exception:
-                pass  # skip days with no data
+                        available_dates.add(date_str)
             current += datetime.timedelta(days=1)
 
-        if not trend:
-            return f"No training load data found between {start_date} and {end_date}."
-
-        return json.dumps({
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_with_data": len(trend),
-            "trend": trend,
-        }, indent=2)
+        return _trend_envelope(
+            start_date,
+            end_date,
+            days,
+            available_dates,
+            failures,
+            {"days_with_data": len(trend), "trend": trend},
+            stale,
+        )
 
     @app.tool()
     async def get_training_load_balance(date: str) -> str:
@@ -942,18 +1134,7 @@ def register_tools(app):
         # chained .get with a default arg.
         load_balance = data.get("mostRecentTrainingLoadBalance") or {}
         load_map = load_balance.get("metricsTrainingLoadBalanceDTOMap") or {}
-
-        # device-keyed dict; prefer the primary training device, fall back to
-        # the first device with data.
-        load_data: Dict[str, Any] = {}
-        for dev_data in load_map.values():
-            if not isinstance(dev_data, dict):
-                continue
-            if dev_data.get("primaryTrainingDevice"):
-                load_data = dev_data
-                break
-            if not load_data:
-                load_data = dev_data
+        _device_id, load_data = _select_primary_device(load_map)
 
         if not load_data:
             return f"No training load balance data found for {date}."
@@ -1025,7 +1206,9 @@ def register_tools(app):
         lastNight is not used. period_avg_hrv_ms is the mean of nights that have a numeric
         lastNightAvg, including 0; missing nights are omitted from the mean, not filled with 0.
         hrv_sample_count is that number of nights. days_with_data remains the number of dates
-        that returned any HRV summary fields.
+        that returned any HRV summary fields. Coverage lists requested/available/missing/failed
+        days; query failures are classified and not dropped silently. A summary whose
+        calendarDate differs from the requested day is not labeled as that day.
 
         Recommended range: 7-21 days. Maximum: 30 days.
 
@@ -1034,30 +1217,33 @@ def register_tools(app):
             end_date: End date in YYYY-MM-DD format
         """
         MAX_DAYS = 30
-        try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
-
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+        window = _parse_trend_window(start_date, end_date, MAX_DAYS)
+        if isinstance(window, str):
+            return window
+        start, end, days = window
 
         trend = []
+        failures: List[Dict[str, str]] = []
+        stale: List[Dict[str, str]] = []
+        available_dates: Set[str] = set()
         current = start
         while current <= end:
             date_str = current.isoformat()
-            try:
-                data = garmin_client.get_hrv_data(date_str)
-                if data:
-                    hrv_summary = data.get("hrvSummary", {})
+            status, payload = _call_for_day(garmin_client.get_hrv_data, date_str)
+            if status == "failed":
+                failures.append({"date": date_str, "kind": payload})
+            elif status == "ok":
+                hrv_summary = _as_dict(payload.get("hrvSummary"))
+                stale_item = _stale_observation(
+                    date_str, hrv_summary.get("calendarDate")
+                )
+                if stale_item:
+                    stale.append(stale_item)
+                else:
                     entry: Dict[str, Any] = {"date": date_str}
                     last_night = _hrv_last_night_avg_ms(hrv_summary)
                     weekly_avg = hrv_summary.get("weeklyAvg")
-                    status = hrv_summary.get("status")
+                    hrv_status = hrv_summary.get("status")
                     feedback = hrv_summary.get("feedbackPhrase")
                     high_hrv = hrv_summary.get("lastNight5MinHigh")
                     if last_night is not None:
@@ -1066,33 +1252,38 @@ def register_tools(app):
                         entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
                     if high_hrv is not None:
                         entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
-                    if status:
-                        entry["status"] = status
+                    if hrv_status:
+                        entry["status"] = hrv_status
                     if feedback:
                         entry["feedback"] = feedback
                     if len(entry) > 1:
                         trend.append(entry)
-            except Exception:
-                pass
+                        available_dates.add(date_str)
             current += datetime.timedelta(days=1)
 
-        if not trend:
-            return f"No HRV data found between {start_date} and {end_date}."
-
-        # Compute 7-day rolling average from the collected data
-        hrv_values = [e.get("last_night_avg_hrv_ms") for e in trend if e.get("last_night_avg_hrv_ms") is not None]
+        hrv_values = [
+            e.get("last_night_avg_hrv_ms")
+            for e in trend
+            if e.get("last_night_avg_hrv_ms") is not None
+        ]
         rolling_avg = None
         if hrv_values:
             rolling_avg = round(sum(hrv_values) / len(hrv_values), 1)
 
-        return json.dumps({
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_with_data": len(trend),
-            "hrv_sample_count": len(hrv_values),
-            "period_avg_hrv_ms": rolling_avg,
-            "trend": trend,
-        }, indent=2)
+        return _trend_envelope(
+            start_date,
+            end_date,
+            days,
+            available_dates,
+            failures,
+            {
+                "days_with_data": len(trend),
+                "hrv_sample_count": len(hrv_values),
+                "period_avg_hrv_ms": rolling_avg,
+                "trend": trend,
+            },
+            stale,
+        )
 
     @app.tool()
     async def get_vo2max_trend(start_date: str, end_date: str) -> str:
@@ -1106,7 +1297,9 @@ def register_tools(app):
         are within normal noise. Focus on the 4-6 week trend direction.
 
         If historical values are unavailable, the current profile estimate is returned
-        separately and is not represented as a historical trend point.
+        separately and is not represented as a historical trend point. Coverage lists
+        requested/available/missing/failed days. A VO2 sample dated to another day is
+        not labeled as the requested day.
 
         Recommended range: 4-12 weeks. Maximum: 90 days.
 
@@ -1115,22 +1308,18 @@ def register_tools(app):
             end_date: End date in YYYY-MM-DD format
         """
         MAX_DAYS = 90
-        try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
-
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+        window = _parse_trend_window(start_date, end_date, MAX_DAYS)
+        if isinstance(window, str):
+            return window
+        start, end, days = window
 
         histories: Dict[str, List[Dict[str, Any]]] = {
             "running": [],
             "cycling": [],
         }
+        failures: List[Dict[str, str]] = []
+        stale: List[Dict[str, str]] = []
+        source_failures: List[Dict[str, str]] = []
         range_measurements: Optional[Dict[str, Dict[str, float]]] = None
         try:
             range_supported, range_data = _get_max_metrics_range(
@@ -1138,10 +1327,16 @@ def register_tools(app):
             )
             if range_supported:
                 range_measurements = _extract_dated_vo2_measurements(range_data)
-        except Exception:
+        except Exception as exc:
             # The range endpoint exists but failed. Continue with training status
             # without retrying the same max-metrics endpoint once per day.
             range_measurements = {}
+            source_failures.append(
+                {
+                    "source": "get_max_metrics",
+                    "kind": _classify_garmin_failure(exc),
+                }
+            )
 
         current = start
         while current <= end:
@@ -1157,27 +1352,47 @@ def register_tools(app):
             else:
                 method_names = ("get_training_status", "get_max_metrics")
 
+            errors: List[str] = []
+            attempts = 0
+            pending_stale: Optional[Dict[str, str]] = None
             for method_name in method_names:
                 method = getattr(garmin_client, method_name, None)
                 if not callable(method):
                     continue
+                attempts += 1
                 try:
-                    measurements = _extract_vo2_measurements(method(date_str))
-                except Exception:
+                    payload = method(date_str)
+                except Exception as exc:
+                    errors.append(_classify_garmin_failure(exc))
                     continue
-                if not measurements:
+                day_measurements = _vo2_measurements_for_date(payload, date_str)
+                if not day_measurements:
+                    for sport in _extract_vo2_measurements(payload):
+                        stale_item = _stale_observation(
+                            date_str, _vo2_observed_date(payload, sport)
+                        )
+                        if stale_item:
+                            pending_stale = stale_item
+                            break
                     continue
+                measurements = day_measurements
                 source = method_name
+                pending_stale = None
                 break
 
-            for sport, vo2 in measurements.items():
-                histories[sport].append(
-                    {
-                        "date": date_str,
-                        "vo2_max": round(vo2, 1),
-                        "source": source,
-                    }
-                )
+            if measurements:
+                for sport, vo2 in measurements.items():
+                    histories[sport].append(
+                        {
+                            "date": date_str,
+                            "vo2_max": round(vo2, 1),
+                            "source": source,
+                        }
+                    )
+            elif pending_stale:
+                stale.append(pending_stale)
+            elif errors and attempts and len(errors) == attempts:
+                failures.append({"date": date_str, "kind": errors[-1]})
             current += datetime.timedelta(days=1)
 
         selected_sport = None
@@ -1213,8 +1428,6 @@ def register_tools(app):
                     "running" if "running" in profile_measurements else "cycling"
                 )
                 current_estimate = profile_measurements[current_sport]
-            else:
-                return f"No VO2 max data found between {start_date} and {end_date}."
 
         first_vo2 = trend[0]["vo2_max"] if trend else None
         latest_vo2 = trend[-1]["vo2_max"] if trend else None
@@ -1224,9 +1437,7 @@ def register_tools(app):
             else None
         )
 
-        response = {
-            "start_date": start_date,
-            "end_date": end_date,
+        extra: Dict[str, Any] = {
             "data_points": len(trend),
             "first_vo2_max": first_vo2,
             "latest_vo2_max": latest_vo2,
@@ -1234,20 +1445,29 @@ def register_tools(app):
             "trend": trend,
         }
         if selected_sport is not None:
-            response["sport"] = selected_sport
-
+            extra["sport"] = selected_sport
         if current_estimate is not None:
-            response["current_vo2_max_estimate"] = {
+            extra["current_vo2_max_estimate"] = {
                 "vo2_max": round(current_estimate, 1),
                 "sport": current_sport,
                 "source": "get_user_profile",
             }
-            response["note"] = (
+            extra["note"] = (
                 "Historical VO2 max values were not available from Garmin; "
                 "returning the current profile estimate separately."
             )
 
-        return json.dumps(response, indent=2)
+        if source_failures:
+            extra["source_failures"] = source_failures
+
+        available_dates = (
+            {entry["date"] for entry in histories[selected_sport]}
+            if selected_sport is not None
+            else set()
+        )
+        return _trend_envelope(
+            start_date, end_date, days, available_dates, failures, extra, stale
+        )
 
     @app.tool()
     async def get_respiration_trend(start_date: str, end_date: str) -> str:
@@ -1257,6 +1477,10 @@ def register_tools(app):
         warning sign for overreaching, illness, or poor recovery. Use this alongside HRV
         trend for a complete recovery picture.
 
+        Coverage lists requested/available/missing/failed days. Failures are
+        classified and not dropped silently. A sample whose calendarDate differs
+        from the requested day is not labeled as that day.
+
         Recommended range: 7-21 days. Maximum: 30 days.
 
         Args:
@@ -1264,30 +1488,35 @@ def register_tools(app):
             end_date: End date in YYYY-MM-DD format
         """
         MAX_DAYS = 30
-        try:
-            start = datetime.date.fromisoformat(start_date)
-            end = datetime.date.fromisoformat(end_date)
-        except ValueError as e:
-            return f"Invalid date format: {e}. Use YYYY-MM-DD."
-
-        days = (end - start).days + 1
-        if days > MAX_DAYS:
-            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
-        if days < 1:
-            return "end_date must be on or after start_date."
+        window = _parse_trend_window(start_date, end_date, MAX_DAYS)
+        if isinstance(window, str):
+            return window
+        start, end, days = window
 
         trend = []
+        failures: List[Dict[str, str]] = []
+        stale: List[Dict[str, str]] = []
+        available_dates: Set[str] = set()
         current = start
         while current <= end:
             date_str = current.isoformat()
-            try:
-                data = garmin_client.get_respiration_data(date_str)
-                if data:
+            status, payload = _call_for_day(
+                garmin_client.get_respiration_data, date_str
+            )
+            if status == "failed":
+                failures.append({"date": date_str, "kind": payload})
+            elif status == "ok":
+                stale_item = _stale_observation(
+                    date_str, payload.get("calendarDate")
+                )
+                if stale_item:
+                    stale.append(stale_item)
+                else:
                     entry: Dict[str, Any] = {"date": date_str}
-                    avg_waking = data.get("avgWakingRespirationValue")
-                    avg_sleep = data.get("avgSleepRespirationValue")
-                    high_sleep = data.get("highestRespirationValue")
-                    low_sleep = data.get("lowestRespirationValue")
+                    avg_waking = payload.get("avgWakingRespirationValue")
+                    avg_sleep = payload.get("avgSleepRespirationValue")
+                    high_sleep = payload.get("highestRespirationValue")
+                    low_sleep = payload.get("lowestRespirationValue")
                     if avg_waking is not None:
                         entry["avg_waking_breaths_per_min"] = round(avg_waking, 1)
                     if avg_sleep is not None:
@@ -1298,22 +1527,30 @@ def register_tools(app):
                         entry["lowest_breaths_per_min"] = round(low_sleep, 1)
                     if len(entry) > 1:
                         trend.append(entry)
-            except Exception:
-                pass
+                        available_dates.add(date_str)
             current += datetime.timedelta(days=1)
 
-        if not trend:
-            return f"No respiration data found between {start_date} and {end_date}."
+        sleep_values = [
+            e["avg_sleep_breaths_per_min"]
+            for e in trend
+            if "avg_sleep_breaths_per_min" in e
+        ]
+        avg_sleep_overall = (
+            round(sum(sleep_values) / len(sleep_values), 1) if sleep_values else None
+        )
 
-        sleep_values = [e["avg_sleep_breaths_per_min"] for e in trend if "avg_sleep_breaths_per_min" in e]
-        avg_sleep_overall = round(sum(sleep_values) / len(sleep_values), 1) if sleep_values else None
-
-        return json.dumps({
-            "start_date": start_date,
-            "end_date": end_date,
-            "days_with_data": len(trend),
-            "period_avg_sleep_breaths_per_min": avg_sleep_overall,
-            "trend": trend,
-        }, indent=2)
+        return _trend_envelope(
+            start_date,
+            end_date,
+            days,
+            available_dates,
+            failures,
+            {
+                "days_with_data": len(trend),
+                "period_avg_sleep_breaths_per_min": avg_sleep_overall,
+                "trend": trend,
+            },
+            stale,
+        )
 
     return app

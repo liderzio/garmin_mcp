@@ -783,6 +783,8 @@ Once connected in Claude, you can ask questions like:
 - "Show me my HRV trend for the last 2 weeks and flag any recovery concerns"
 
 `get_hrv_data` and `get_hrv_trend` both read Garmin `hrvSummary.lastNightAvg` (ms). `lastNight` is not an alias. Trend `period_avg_hrv_ms` averages only nights with a numeric sample (`hrv_sample_count`); a missing night is omitted, `0` is kept.
+
+Trend tools (`get_training_load_trend`, `get_hrv_trend`, `get_vo2max_trend`, `get_respiration_trend`) add `coverage` (`requested` / `available` / `missing` / `failed` / `stale`) and per-day `failures` with `kind` `authentication`, `rate_limit`, or `connection`. Missing days stay missing — they are not filled with zero. An observation whose `calendarDate` differs from the requested day is listed in `stale` with `requested_date` and `observed_date`, not labeled as the requested day. Load trend points include `device_id` from the primary training device. `get_vo2max_trend` still returns `current_vo2_max_estimate` separately when history is unavailable; the profile is not written into `trend`. A failed VO₂ range request is listed in `source_failures` without being copied into the daily series.
 - "What's my season best 20-minute power and when did I set it?"
 
 ## Troubleshooting
