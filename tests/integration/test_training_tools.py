@@ -169,21 +169,121 @@ async def test_get_training_effect_tool(app_with_training, mock_garmin_client):
     mock_garmin_client.get_activity.assert_called_once_with(12345678901)
 
 
+def _hrv_payload(last_night_avg, *, weekly_avg=45, calendar_date="2024-01-15"):
+    """Synthetic Garmin HRV payload. lastNightAvg is the observed overnight field.
+
+    last_night_avg=None omits lastNightAvg (absence). Never includes lastNight —
+    that name is not the overnight average in Garmin's hrvSummary.
+    """
+    payload = json.loads(json.dumps(MOCK_HRV_DATA))
+    summary = payload["hrvSummary"]
+    summary["calendarDate"] = calendar_date
+    summary["weeklyAvg"] = weekly_avg
+    summary.pop("lastNight", None)
+    if last_night_avg is None:
+        summary.pop("lastNightAvg", None)
+    else:
+        summary["lastNightAvg"] = last_night_avg
+    return payload
+
+
+def _tool_json(result):
+    return json.loads(result[0][0].text)
+
+
 @pytest.mark.asyncio
 async def test_get_hrv_data_tool(app_with_training, mock_garmin_client):
     """Test get_hrv_data tool"""
-    # Setup mock
     mock_garmin_client.get_hrv_data.return_value = MOCK_HRV_DATA
 
-    # Call tool
     result = await app_with_training.call_tool(
         "get_hrv_data",
         {"date": "2024-01-15"}
     )
 
-    # Verify
-    assert result is not None
+    data = _tool_json(result)
+    assert data["last_night_avg_hrv_ms"] == 48
     mock_garmin_client.get_hrv_data.assert_called_once_with("2024-01-15")
+
+
+@pytest.mark.asyncio
+async def test_hrv_daily_and_trend_agree_on_last_night_avg(app_with_training, mock_garmin_client):
+    """Same lastNightAvg observation must match between daily and trend (T08)."""
+    mock_garmin_client.get_hrv_data.side_effect = lambda date: _hrv_payload(48, calendar_date=date)
+
+    daily = _tool_json(await app_with_training.call_tool("get_hrv_data", {"date": "2024-01-15"}))
+    trend = _tool_json(await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+    ))
+
+    assert daily["last_night_avg_hrv_ms"] == 48
+    assert trend["trend"][0]["last_night_avg_hrv_ms"] == 48
+    assert trend["period_avg_hrv_ms"] == 48
+    assert trend["hrv_sample_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_hrv_zero_is_not_missing(app_with_training, mock_garmin_client):
+    """Overnight HRV of 0 is a valid sample, distinct from an omitted field (T03)."""
+    mock_garmin_client.get_hrv_data.side_effect = lambda date: _hrv_payload(0, calendar_date=date)
+
+    daily = _tool_json(await app_with_training.call_tool("get_hrv_data", {"date": "2024-01-15"}))
+    trend = _tool_json(await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+    ))
+
+    assert daily["last_night_avg_hrv_ms"] == 0
+    assert trend["trend"][0]["last_night_avg_hrv_ms"] == 0
+    assert trend["hrv_sample_count"] == 1
+    assert trend["period_avg_hrv_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_hrv_trend_ignores_unproven_last_night_alias(app_with_training, mock_garmin_client):
+    """lastNight is not a proven alias of lastNightAvg — do not copy it into the average."""
+    payload = _hrv_payload(None)
+    payload["hrvSummary"]["lastNight"] = 99
+    mock_garmin_client.get_hrv_data.return_value = payload
+
+    daily = _tool_json(await app_with_training.call_tool("get_hrv_data", {"date": "2024-01-15"}))
+    trend = _tool_json(await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+    ))
+
+    assert "last_night_avg_hrv_ms" not in daily
+    assert "last_night_avg_hrv_ms" not in trend["trend"][0]
+    assert trend.get("hrv_sample_count") == 0
+    assert trend.get("period_avg_hrv_ms") is None
+
+
+@pytest.mark.asyncio
+async def test_hrv_period_average_skips_missing_nights(app_with_training, mock_garmin_client):
+    """Period average uses only nights with lastNightAvg; missing days are not zeros."""
+
+    def by_date(date):
+        values = {
+            "2024-01-15": 48,
+            "2024-01-16": None,
+            "2024-01-17": 0,
+        }
+        return _hrv_payload(values[date], calendar_date=date)
+
+    mock_garmin_client.get_hrv_data.side_effect = by_date
+
+    trend = _tool_json(await app_with_training.call_tool(
+        "get_hrv_trend",
+        {"start_date": "2024-01-15", "end_date": "2024-01-17"},
+    ))
+
+    by_day = {row["date"]: row for row in trend["trend"]}
+    assert by_day["2024-01-15"]["last_night_avg_hrv_ms"] == 48
+    assert "last_night_avg_hrv_ms" not in by_day["2024-01-16"]
+    assert by_day["2024-01-17"]["last_night_avg_hrv_ms"] == 0
+    assert trend["hrv_sample_count"] == 2
+    assert trend["period_avg_hrv_ms"] == 24.0
 
 
 @pytest.mark.asyncio

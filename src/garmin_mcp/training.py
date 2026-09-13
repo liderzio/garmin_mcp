@@ -26,6 +26,22 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _hrv_last_night_avg_ms(summary: Any) -> Optional[Union[int, float]]:
+    """Overnight HRV average from Garmin hrvSummary.lastNightAvg.
+
+    lastNight is a different, unproven name — do not treat it as an alias.
+    0 is a valid sample; missing/non-numeric is absence.
+    """
+    value = _as_dict(summary).get("lastNightAvg")
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
 def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
     """Find all VO2 max values by sport in known Garmin response shapes."""
     if isinstance(data, list):
@@ -431,6 +447,9 @@ def register_tools(app):
     async def get_hrv_data(date: str, return_timeseries: bool = False) -> str:
         """Get Heart Rate Variability (HRV) data
 
+        Overnight average comes from Garmin hrvSummary.lastNightAvg (milliseconds).
+        A missing lastNightAvg is omitted; 0 is returned as 0. lastNight is not an alias.
+
         Args:
             date: Date in YYYY-MM-DD format
             return_timeseries: If True, include detailed 5-minute HRV readings (can be large)
@@ -447,8 +466,8 @@ def register_tools(app):
             # Curate to essential fields only
             curated = {
                 "date": summary.get("calendarDate") or date,
-                # Current HRV values
-                "last_night_avg_hrv_ms": summary.get("lastNightAvg"),
+                # Current HRV values (Garmin field: lastNightAvg — not lastNight)
+                "last_night_avg_hrv_ms": _hrv_last_night_avg_ms(summary),
                 "last_night_5min_high_hrv_ms": summary.get("lastNight5MinHigh"),
                 # Weekly average
                 "weekly_avg_hrv_ms": summary.get("weeklyAvg"),
@@ -1002,6 +1021,12 @@ def register_tools(app):
         to act on — use this tool to identify baseline shifts that signal accumulated fatigue
         or recovery. A drop of >10ms from the 7-day baseline warrants reducing training load.
 
+        Overnight average is read from Garmin's lastNightAvg (same field as get_hrv_data).
+        lastNight is not used. period_avg_hrv_ms is the mean of nights that have a numeric
+        lastNightAvg, including 0; missing nights are omitted from the mean, not filled with 0.
+        hrv_sample_count is that number of nights. days_with_data remains the number of dates
+        that returned any HRV summary fields.
+
         Recommended range: 7-21 days. Maximum: 30 days.
 
         Args:
@@ -1030,13 +1055,13 @@ def register_tools(app):
                 if data:
                     hrv_summary = data.get("hrvSummary", {})
                     entry: Dict[str, Any] = {"date": date_str}
-                    last_night = hrv_summary.get("lastNight")
+                    last_night = _hrv_last_night_avg_ms(hrv_summary)
                     weekly_avg = hrv_summary.get("weeklyAvg")
                     status = hrv_summary.get("status")
                     feedback = hrv_summary.get("feedbackPhrase")
                     high_hrv = hrv_summary.get("lastNight5MinHigh")
                     if last_night is not None:
-                        entry["last_night_avg_hrv_ms"] = round(last_night, 1)
+                        entry["last_night_avg_hrv_ms"] = last_night
                     if weekly_avg is not None:
                         entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
                     if high_hrv is not None:
@@ -1064,6 +1089,7 @@ def register_tools(app):
             "start_date": start_date,
             "end_date": end_date,
             "days_with_data": len(trend),
+            "hrv_sample_count": len(hrv_values),
             "period_avg_hrv_ms": rolling_avg,
             "trend": trend,
         }, indent=2)

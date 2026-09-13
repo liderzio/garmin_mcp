@@ -781,6 +781,8 @@ Once connected in Claude, you can ask questions like:
 - "What was my power duration curve from yesterday's ride? Estimate my FTP."
 - "Analyze the FIT data from my last cycling activity — how was my shifting quality on the climbs?"
 - "Show me my HRV trend for the last 2 weeks and flag any recovery concerns"
+
+`get_hrv_data` and `get_hrv_trend` both read Garmin `hrvSummary.lastNightAvg` (ms). `lastNight` is not an alias. Trend `period_avg_hrv_ms` averages only nights with a numeric sample (`hrv_sample_count`); a missing night is omitted, `0` is kept.
 - "What's my season best 20-minute power and when did I set it?"
 
 ## Troubleshooting
