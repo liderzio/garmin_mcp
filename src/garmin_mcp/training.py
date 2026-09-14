@@ -132,14 +132,14 @@ def _trend_coverage(
     failed_dates: Set[str],
     stale_dates: Optional[Set[str]] = None,
 ) -> Dict[str, int]:
-    """Requested/available/missing/failed/stale counts for a daily trend window."""
+    """Count observed states; a partially available day may also fail or be stale."""
     available = len(available_dates)
     failed = len(failed_dates)
     stale = len(stale_dates or set())
     return {
         "requested": days_requested,
         "available": available,
-        "missing": days_requested - available - failed - stale,
+        "missing": days_requested - len(available_dates | failed_dates | (stale_dates or set())),
         "failed": failed,
         "stale": stale,
     }
@@ -1088,8 +1088,13 @@ def register_tools(app):
                     vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
                         "generic"
                     ) or {}
+                    vo2_data = _as_dict(vo2_data)
+                    vo2_stale = _stale_observation(date_str, vo2_data.get("calendarDate"))
+                    if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
+                        stale.append({**vo2_stale, "metric": "vo2_max"})
+                        vo2_data = {}
                     entry = _training_load_entry(
-                        date_str, status_data, _as_dict(vo2_data), device_id
+                        date_str, status_data, vo2_data, device_id
                     )
                     if entry is not None:
                         trend.append(entry)
@@ -1352,18 +1357,19 @@ def register_tools(app):
             else:
                 method_names = ("get_training_status", "get_max_metrics")
 
-            errors: List[str] = []
-            attempts = 0
             pending_stale: Optional[Dict[str, str]] = None
             for method_name in method_names:
                 method = getattr(garmin_client, method_name, None)
                 if not callable(method):
                     continue
-                attempts += 1
                 try:
                     payload = method(date_str)
                 except Exception as exc:
-                    errors.append(_classify_garmin_failure(exc))
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                        "source": method_name,
+                    })
                     continue
                 day_measurements = _vo2_measurements_for_date(payload, date_str)
                 if not day_measurements:
@@ -1391,8 +1397,6 @@ def register_tools(app):
                     )
             elif pending_stale:
                 stale.append(pending_stale)
-            elif errors and attempts and len(errors) == attempts:
-                failures.append({"date": date_str, "kind": errors[-1]})
             current += datetime.timedelta(days=1)
 
         selected_sport = None

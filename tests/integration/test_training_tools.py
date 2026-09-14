@@ -1238,5 +1238,52 @@ async def test_vo2max_trend_classifies_daily_failures(
     assert data["coverage"]["available"] == 1
     assert data["coverage"]["failed"] == 1
     assert data["trend"][0]["vo2_max"] == 48.0
-    assert data["failures"] == [{"date": "2024-01-15", "kind": "rate_limit"}]
+    assert data["failures"] == [{"date": "2024-01-15", "kind": "rate_limit", "source": "get_training_status"}]
     mock_garmin_client.get_user_profile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_load_trend_keeps_current_load_but_reports_stale_vo2(app_with_training, mock_garmin_client):
+    def by_date(date):
+        payload = _training_status(date)
+        payload['mostRecentVO2Max'] = {
+            'generic': {'calendarDate': '2024-01-01', 'vo2MaxValue': 48.0}
+        }
+        return payload
+
+    mock_garmin_client.get_training_status.side_effect = by_date
+    data = _tool_json(await app_with_training.call_tool('get_training_load_trend', {
+        'start_date': '2024-01-14', 'end_date': '2024-01-15',
+    }))
+    assert len(data['trend']) == 2
+    assert all('atl' in point and 'vo2_max' not in point for point in data['trend'])
+    assert data['coverage'] == {'requested': 2, 'available': 2, 'missing': 0, 'failed': 0, 'stale': 2}
+    assert all(item['observed_date'] == '2024-01-01' and item['metric'] == 'vo2_max' for item in data['stale'])
+
+
+@pytest.mark.asyncio
+async def test_load_trend_keeps_vo2_observed_on_requested_day(app_with_training, mock_garmin_client):
+    payload = _training_status('2024-01-14')
+    payload['mostRecentVO2Max'] = {'generic': {'calendarDate': '2024-01-14', 'vo2MaxValue': 48.0}}
+    mock_garmin_client.get_training_status.return_value = payload
+    data = _tool_json(await app_with_training.call_tool('get_training_load_trend', {
+        'start_date': '2024-01-14', 'end_date': '2024-01-14',
+    }))
+    assert data['trend'][0]['vo2_max'] == 48.0
+    assert data['stale'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fallback', [None, {}, {'generic': {'vo2MaxValue': 48.0, 'calendarDate': '2024-01-01'}}, {'generic': {'vo2MaxValue': 48.0, 'calendarDate': '2024-01-14'}}])
+async def test_vo2_trend_preserves_failure_when_fallback_responds(app_with_training, mock_garmin_client, fallback):
+    mock_garmin_client.garmin_connect_metrics_url = None
+    mock_garmin_client.get_training_status.side_effect = GarminConnectTooManyRequestsError('429')
+    mock_garmin_client.get_max_metrics.return_value = fallback
+    mock_garmin_client.get_user_profile.return_value = {}
+    data = _tool_json(await app_with_training.call_tool('get_vo2max_trend', {
+        'start_date': '2024-01-14', 'end_date': '2024-01-14',
+    }))
+    assert data['failures'] == [{'date': '2024-01-14', 'kind': 'rate_limit', 'source': 'get_training_status'}]
+    assert data['coverage']['failed'] == 1
+    assert data['coverage']['missing'] == 0
+    assert data['coverage']['available'] == int(bool(data['trend']))
