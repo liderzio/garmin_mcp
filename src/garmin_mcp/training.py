@@ -5,6 +5,7 @@ Training and performance functions for Garmin Connect MCP Server
 import json
 import datetime
 import math
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from garminconnect import (
@@ -17,6 +18,15 @@ garmin_client = None
 
 # Cache for activity type mapping
 _activity_type_cache: Optional[Dict[int, str]] = None
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date(value: str, field: str = "date") -> str:
+    if not _DATE_RE.match(value):
+        raise ValueError(f"Invalid {field} '{value}': expected YYYY-MM-DD")
+    return value
 
 
 def configure(client):
@@ -629,6 +639,68 @@ def register_tools(app):
             return json.dumps(curated, indent=2)
         except Exception as e:
             return f"Error retrieving endurance score data: {str(e)}"
+
+    @app.tool()
+    async def get_running_tolerance(
+        start_date: str,
+        end_date: str,
+        aggregation: str = "weekly",
+    ) -> str:
+        """Get running tolerance observations between dates.
+
+        Dated impact-load tolerance from a compatible running watch.
+        An empty window is no observation — not a zero tolerance. The
+        metric is conditional evidence; it does not authorize intensity
+        or define a clinical threshold.
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            aggregation: "weekly" (default) or "daily"
+        """
+        try:
+            _validate_date(start_date, "start_date")
+            _validate_date(end_date, "end_date")
+            if aggregation not in ("daily", "weekly"):
+                raise ValueError(
+                    f"invalid aggregation '{aggregation}', must be 'daily' or 'weekly'"
+                )
+            raw = garmin_client.get_running_tolerance(
+                start_date, end_date, aggregation
+            )
+            rows = raw if isinstance(raw, list) else []
+            observations = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                point = {
+                    "date": item.get("calendarDate"),
+                    "tolerance": item.get("tolerance"),
+                    "impact_load": item.get("totalImpactLoad"),
+                    "distance_m": item.get("totalDistance"),
+                    "week_start": item.get("startOfWeek"),
+                    "week_end": item.get("endOfWeek"),
+                }
+                observations.append(
+                    {key: value for key, value in point.items() if value is not None}
+                )
+            available = [row["date"] for row in observations if row.get("date")]
+            curated = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "aggregation": aggregation,
+                "count": len(observations),
+                "observations": observations,
+                "coverage": {
+                    "available_dates": available,
+                    "filled_with_zero": False,
+                },
+                "no_data": len(observations) == 0,
+                "score_does_not_authorize": True,
+            }
+            return json.dumps(curated, indent=2)
+        except Exception as e:
+            return f"Error retrieving running tolerance: {str(e)}"
 
     @app.tool()
     async def get_training_effect(activity_id: int) -> str:

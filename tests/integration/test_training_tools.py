@@ -101,7 +101,6 @@ async def test_get_endurance_score_tool(app_with_training, mock_garmin_client):
     assert result is not None
     mock_garmin_client.get_endurance_score.assert_called_once_with("2024-01-08", "2024-01-15")
 
-    # Parse the result and verify content
     data = json.loads(result[0][0].text)
 
     # Check period summary
@@ -146,6 +145,68 @@ async def test_get_endurance_score_tool(app_with_training, mock_garmin_client):
     assert week["week_start"] == "2024-01-08"
     assert week["avg_score"] == 5548
     assert week["max_score"] == 5561
+
+
+@pytest.mark.asyncio
+async def test_get_running_tolerance_tool(app_with_training, mock_garmin_client):
+    """Running tolerance keeps dated values and does not fill gaps with zero."""
+    mock_garmin_client.get_running_tolerance.return_value = [
+        {
+            "userProfilePK": 1,
+            "calendarDate": "2026-03-15",
+            "totalImpactLoad": 53800,
+            "totalDistance": 49615.0,
+            "tolerance": 60914,
+            "startOfWeek": "2026-03-11",
+            "endOfWeek": "2026-03-15",
+            "weekIndex": 1888,
+        },
+        {
+            "userProfilePK": 1,
+            "calendarDate": "2026-03-18",
+            "totalImpactLoad": 14610,
+            "totalDistance": 11036.0,
+            "tolerance": 0,
+            "startOfWeek": "2026-03-16",
+            "endOfWeek": "2026-03-18",
+            "weekIndex": 1889,
+        },
+    ]
+
+    result = await app_with_training.call_tool(
+        "get_running_tolerance",
+        {
+            "start_date": "2026-03-11",
+            "end_date": "2026-03-18",
+            "aggregation": "weekly",
+        },
+    )
+    data = json.loads(result[0][0].text)
+    assert data["count"] == 2
+    assert data["no_data"] is False
+    assert data["coverage"]["filled_with_zero"] is False
+    assert data["score_does_not_authorize"] is True
+    assert data["observations"][0]["date"] == "2026-03-15"
+    assert data["observations"][0]["tolerance"] == 60914
+    assert data["observations"][1]["tolerance"] == 0
+    mock_garmin_client.get_running_tolerance.assert_called_once_with(
+        "2026-03-11", "2026-03-18", "weekly"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_running_tolerance_empty_is_not_zero(app_with_training, mock_garmin_client):
+    mock_garmin_client.get_running_tolerance.return_value = []
+    result = await app_with_training.call_tool(
+        "get_running_tolerance",
+        {"start_date": "2026-03-11", "end_date": "2026-03-18"},
+    )
+    data = json.loads(result[0][0].text)
+    assert data["count"] == 0
+    assert data["no_data"] is True
+    assert data["observations"] == []
+    assert data["coverage"]["filled_with_zero"] is False
+    assert 0 not in [row.get("tolerance") for row in data["observations"]]
 
 
 @pytest.mark.asyncio
