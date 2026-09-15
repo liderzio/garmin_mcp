@@ -1211,23 +1211,24 @@ def register_tools(app):
                     )
                     if stale_item:
                         stale.append(stale_item)
-                    else:
-                        vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
-                            "generic"
-                        ) or {}
-                        vo2_data = _as_dict(vo2_data)
-                        vo2_stale = _stale_observation(
-                            date_str, vo2_data.get("calendarDate")
-                        )
-                        if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
-                            stale.append({**vo2_stale, "metric": "vo2_max"})
-                            vo2_data = {}
-                        entry = _training_load_entry(
-                            date_str, status_data, vo2_data, device_id
-                        )
-                        if entry is not None:
-                            trend.append(entry)
-                            available_dates.add(date_str)
+                        status_data = {}
+                        device_id = None
+                    vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
+                        "generic"
+                    ) or {}
+                    vo2_data = _as_dict(vo2_data)
+                    vo2_stale = _stale_observation(
+                        date_str, vo2_data.get("calendarDate")
+                    )
+                    if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
+                        stale.append({**vo2_stale, "metric": "vo2_max"})
+                        vo2_data = {}
+                    entry = _training_load_entry(
+                        date_str, status_data, vo2_data, device_id
+                    )
+                    if entry is not None:
+                        trend.append(entry)
+                        available_dates.add(date_str)
                 except Exception as exc:
                     failures.append({
                         "date": date_str,

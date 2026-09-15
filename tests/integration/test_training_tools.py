@@ -1153,6 +1153,34 @@ async def test_training_load_uses_first_nonempty_device_as_fallback(
     assert data["trend"][0]["atl"] == 250.0
 
 
+@pytest.mark.asyncio
+async def test_training_load_trend_keeps_current_vo2_when_load_is_stale(
+    app_with_training, mock_garmin_client
+):
+    payload = _training_status("2024-01-14")
+    payload["mostRecentVO2Max"] = {
+        "generic": {"calendarDate": "2024-01-15", "vo2MaxValue": 48.0}
+    }
+    mock_garmin_client.get_training_status.return_value = payload
+
+    data = _tool_json(
+        await app_with_training.call_tool(
+            "get_training_load_trend",
+            {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+        )
+    )
+
+    assert data["coverage"] == {
+        "requested": 1,
+        "available": 1,
+        "missing": 0,
+        "failed": 0,
+        "stale": 1,
+    }
+    assert data["trend"] == [{"date": "2024-01-15", "vo2_max": 48.0}]
+    assert data["stale"][0]["observed_date"] == "2024-01-14"
+
+
 def _respiration(calendar_date, *, sleep=13.0, waking=14.0):
     return {
         "calendarDate": calendar_date,
