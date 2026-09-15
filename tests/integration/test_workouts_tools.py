@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 
 from garmin_mcp import workouts
 from garmin_mcp.workouts import (
+    _curate_workout_step,
     _fix_repeat_group_step,
     _normalize_workout_steps,
 )
@@ -17,6 +18,19 @@ from tests.fixtures.garmin_responses import (
     MOCK_WORKOUT_DETAILS,
     MOCK_SWIM_WORKOUT_DETAILS,
 )
+
+
+def test_curate_repeat_group_preserves_skip_last_rest_step():
+    curated = _curate_workout_step({
+        "type": "RepeatGroupDTO",
+        "stepType": {"stepTypeKey": "repeat"},
+        "numberOfIterations": 3,
+        "skipLastRestStep": True,
+        "workoutSteps": [],
+    })
+
+    assert curated["repeat_count"] == 3
+    assert curated["skip_last_rest_step"] is True
 
 
 @pytest.fixture

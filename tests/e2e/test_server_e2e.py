@@ -13,12 +13,14 @@ Run with: pytest tests/e2e/ -m e2e
 Or skip with: pytest -m "not e2e"
 """
 
+import json
+import asyncio
 import os
 import sys
-import pytest
-import asyncio
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 from dotenv import load_dotenv
 
 # Import MCP client for testing
@@ -90,7 +92,7 @@ async def test_mcp_server_connection():
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_list_activities_tool():
-    """Test the list_activities MCP tool with real API"""
+    """Test the get_activities MCP tool with real API."""
     server_params = _build_server_params()
 
     try:
@@ -99,18 +101,23 @@ async def test_list_activities_tool():
                 async with ClientSession(read, write) as session:
                     await session.initialize()
 
-                    # Test list_activities
+                    # Test the currently registered paginated activity tool.
                     result = await session.call_tool(
-                        "list_activities",
+                        "get_activities",
                         arguments={"limit": 2}
                     )
 
-                    # Verify result
+                    # Unknown tools are returned as content by MCP, so assert the
+                    # protocol error flag and the response schema as well.
                     assert result is not None
+                    assert not result.isError
                     assert len(result.content) > 0
+                    result_data = json.loads(result.content[0].text)
+                    assert result_data["count"] <= 2
+                    assert isinstance(result_data["activities"], list)
 
                     # Print result for debugging
-                    print(f"\nlist_activities result preview:")
+                    print("\nget_activities result preview:")
                     print(result.content[0].text[:500] + "...")
     except asyncio.TimeoutError:
         pytest.fail("Tool execution timed out - check your Garmin credentials and network")
@@ -142,7 +149,7 @@ async def test_get_steps_data_tool():
                     assert len(result.content) > 0
 
                     # Print result for debugging
-                    print(f"\nget_steps_data result preview:")
+                    print("\nget_steps_data result preview:")
                     print(result.content[0].text[:500] + "...")
     except asyncio.TimeoutError:
         pytest.fail("Tool execution timed out - check your Garmin credentials and network")
@@ -242,7 +249,7 @@ async def test_schedule_workouts_tool():
                     assert result_data["total"] == len(schedules)
                     assert len(result_data["results"]) == len(schedules)
 
-                    print(f"\nschedule_workout result:")
+                    print("\nschedule_workout result:")
                     print(json.dumps(result_data, indent=2))
     except asyncio.TimeoutError:
         pytest.fail("schedule_workout test timed out - check your Garmin credentials and network")
@@ -304,7 +311,7 @@ async def test_upload_workouts_tool():
                     assert result_data["total"] == 2
                     assert len(result_data["results"]) == 2
 
-                    print(f"\nupload_workouts result:")
+                    print("\nupload_workouts result:")
                     print(json.dumps(result_data, indent=2))
 
                     # Clean up: delete any workouts that were successfully created
@@ -362,7 +369,7 @@ async def test_delete_workouts_tool():
                     assert result_data["total"] == 2
                     assert len(result_data["results"]) == 2
 
-                    print(f"\ndelete_workouts result:")
+                    print("\ndelete_workouts result:")
                     print(json.dumps(result_data, indent=2))
     except asyncio.TimeoutError:
         pytest.fail("delete_workouts test timed out - check your Garmin credentials and network")
@@ -424,7 +431,7 @@ async def test_schedule_workouts_inline_upload():
                     assert "results" in result_data
                     assert result_data["total"] == 1
 
-                    print(f"\nschedule_workouts inline upload result:")
+                    print("\nschedule_workouts inline upload result:")
                     print(json.dumps(result_data, indent=2))
 
                     # Clean up: delete any workout that was created
@@ -483,7 +490,7 @@ async def test_schedule_workouts_missing_required_fields():
                     assert result_data["failed"] == 1
                     assert result_data["results"][0]["status"] == "failed"
 
-                    print(f"\nschedule_workouts missing fields result:")
+                    print("\nschedule_workouts missing fields result:")
                     print(json.dumps(result_data, indent=2))
     except asyncio.TimeoutError:
         pytest.fail("schedule_workouts missing fields test timed out - check your Garmin credentials and network")

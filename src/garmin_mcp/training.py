@@ -5,6 +5,7 @@ Training and performance functions for Garmin Connect MCP Server
 import json
 import datetime
 import math
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from garminconnect import (
@@ -17,6 +18,21 @@ garmin_client = None
 
 # Cache for activity type mapping
 _activity_type_cache: Optional[Dict[int, str]] = None
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date(value: str, field: str = "date") -> str:
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        raise ValueError(f"Invalid {field} '{value}': expected YYYY-MM-DD")
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {field} '{value}': expected a real YYYY-MM-DD date"
+        ) from exc
+    return value
 
 
 def configure(client):
@@ -208,7 +224,7 @@ def _select_primary_device(
     fallback_key: Any = None
     fallback: Dict[str, Any] = {}
     for device_key, dev_data in mapping.items():
-        if not isinstance(dev_data, dict):
+        if not isinstance(dev_data, dict) or not dev_data:
             continue
         if fallback_key is None:
             fallback_key, fallback = device_key, dev_data
@@ -221,6 +237,14 @@ def _select_primary_device(
 
 def _vo2_observed_date(data: Any, sport: str) -> Optional[str]:
     """calendarDate for a sport's VO2 sample, if Garmin provided one."""
+    if isinstance(data, list):
+        for item in data:
+            if sport not in _extract_vo2_measurements(item):
+                continue
+            observed = _vo2_observed_date(item, sport)
+            if observed:
+                return observed
+        return None
     payload = _as_dict(data)
     section_name = "generic" if sport == "running" else "cycling"
     candidates = (
@@ -239,14 +263,15 @@ def _vo2_observed_date(data: Any, sport: str) -> Optional[str]:
 def _vo2_measurements_for_date(data: Any, requested_date: str) -> Dict[str, float]:
     """VO2 samples that belong to requested_date; stale dated points are omitted."""
     dated = _extract_dated_vo2_measurements(data)
-    if requested_date in dated:
-        return dated[requested_date]
-    if dated:
-        return {}
-
     measurements: Dict[str, float] = {}
     for sport, value in _extract_vo2_measurements(data).items():
-        if _date_belongs_to_request(_vo2_observed_date(data, sport), requested_date):
+        requested_value = dated.get(requested_date, {}).get(sport)
+        sport_has_dated_value = any(sport in by_sport for by_sport in dated.values())
+        if requested_value is not None:
+            measurements[sport] = requested_value
+        elif not sport_has_dated_value and _date_belongs_to_request(
+            _vo2_observed_date(data, sport), requested_date
+        ):
             measurements[sport] = value
     return measurements
 
@@ -426,7 +451,7 @@ def register_tools(app):
             if isinstance(summary_data, list) and len(summary_data) > 0:
                 data = summary_data[0]
             else:
-                return f"Unexpected response format from API"
+                return "Unexpected response format from API"
 
             # Curate to essential fields only
             curated = {
@@ -629,6 +654,107 @@ def register_tools(app):
             return json.dumps(curated, indent=2)
         except Exception as e:
             return f"Error retrieving endurance score data: {str(e)}"
+
+    @app.tool()
+    async def get_running_tolerance(
+        start_date: str,
+        end_date: str,
+        aggregation: str = "weekly",
+    ) -> str:
+        """Get running tolerance observations between dates.
+
+        Dated impact-load tolerance from a compatible running watch.
+        An empty window is no observation — not a zero tolerance. The
+        metric is conditional evidence; it does not authorize intensity
+        or define a clinical threshold.
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+            aggregation: "weekly" (default) or "daily"
+        """
+        try:
+            _validate_date(start_date, "start_date")
+            _validate_date(end_date, "end_date")
+            if end_date < start_date:
+                raise ValueError("end_date must be on or after start_date")
+            if aggregation not in ("daily", "weekly"):
+                raise ValueError(
+                    f"invalid aggregation '{aggregation}', must be 'daily' or 'weekly'"
+                )
+            raw = garmin_client.get_running_tolerance(
+                start_date, end_date, aggregation
+            )
+            rows = raw if isinstance(raw, list) else []
+            observations = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                point = {
+                    "date": item.get("calendarDate"),
+                    "tolerance": item.get("tolerance"),
+                    "impact_load": item.get("totalImpactLoad"),
+                    "distance_m": item.get("totalDistance"),
+                    "week_start": item.get("startOfWeek"),
+                    "week_end": item.get("endOfWeek"),
+                }
+                observations.append(
+                    {key: value for key, value in point.items() if value is not None}
+                )
+            available = [row["date"] for row in observations if row.get("date")]
+            curated = {
+                "start_date": start_date,
+                "end_date": end_date,
+                "aggregation": aggregation,
+                "count": len(observations),
+                "observations": observations,
+                "coverage": {
+                    "available_dates": available,
+                    "filled_with_zero": False,
+                },
+                "no_data": len(observations) == 0,
+                "score_does_not_authorize": True,
+            }
+            return json.dumps(curated, indent=2)
+        except ValueError as e:
+            return json.dumps(
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "aggregation": aggregation,
+                    "count": 0,
+                    "observations": [],
+                    "coverage": {
+                        "available_dates": [],
+                        "failures": ["validation"],
+                        "filled_with_zero": False,
+                    },
+                    "no_data": False,
+                    "failure": {"kind": "validation", "message": str(e)},
+                    "score_does_not_authorize": True,
+                },
+                indent=2,
+            )
+        except Exception as e:
+            kind = _classify_garmin_failure(e)
+            return json.dumps(
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "aggregation": aggregation,
+                    "count": 0,
+                    "observations": [],
+                    "coverage": {
+                        "available_dates": [],
+                        "failures": [kind],
+                        "filled_with_zero": False,
+                    },
+                    "no_data": False,
+                    "failure": {"kind": kind, "message": str(e)},
+                    "score_does_not_authorize": True,
+                },
+                indent=2,
+            )
 
     @app.tool()
     async def get_training_effect(activity_id: int) -> str:
@@ -1076,20 +1202,24 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                recent_status = payload.get("mostRecentTrainingStatus") or {}
-                latest_data = recent_status.get("latestTrainingStatusData") or {}
-                device_id, status_data = _select_primary_device(latest_data)
-                stale_item = _stale_observation(
-                    date_str, status_data.get("calendarDate"), device_id
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
+                try:
+                    recent_status = payload.get("mostRecentTrainingStatus") or {}
+                    latest_data = recent_status.get("latestTrainingStatusData") or {}
+                    device_id, status_data = _select_primary_device(latest_data)
+                    stale_item = _stale_observation(
+                        date_str, status_data.get("calendarDate"), device_id
+                    )
+                    if stale_item:
+                        stale.append(stale_item)
+                        status_data = {}
+                        device_id = None
                     vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
                         "generic"
                     ) or {}
                     vo2_data = _as_dict(vo2_data)
-                    vo2_stale = _stale_observation(date_str, vo2_data.get("calendarDate"))
+                    vo2_stale = _stale_observation(
+                        date_str, vo2_data.get("calendarDate")
+                    )
                     if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
                         stale.append({**vo2_stale, "metric": "vo2_max"})
                         vo2_data = {}
@@ -1099,6 +1229,11 @@ def register_tools(app):
                     if entry is not None:
                         trend.append(entry)
                         available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         return _trend_envelope(
@@ -1238,32 +1373,38 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                hrv_summary = _as_dict(payload.get("hrvSummary"))
-                stale_item = _stale_observation(
-                    date_str, hrv_summary.get("calendarDate")
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
-                    entry: Dict[str, Any] = {"date": date_str}
-                    last_night = _hrv_last_night_avg_ms(hrv_summary)
-                    weekly_avg = hrv_summary.get("weeklyAvg")
-                    hrv_status = hrv_summary.get("status")
-                    feedback = hrv_summary.get("feedbackPhrase")
-                    high_hrv = hrv_summary.get("lastNight5MinHigh")
-                    if last_night is not None:
-                        entry["last_night_avg_hrv_ms"] = last_night
-                    if weekly_avg is not None:
-                        entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
-                    if high_hrv is not None:
-                        entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
-                    if hrv_status:
-                        entry["status"] = hrv_status
-                    if feedback:
-                        entry["feedback"] = feedback
-                    if len(entry) > 1:
-                        trend.append(entry)
-                        available_dates.add(date_str)
+                try:
+                    hrv_summary = _as_dict(payload.get("hrvSummary"))
+                    stale_item = _stale_observation(
+                        date_str, hrv_summary.get("calendarDate")
+                    )
+                    if stale_item:
+                        stale.append(stale_item)
+                    else:
+                        entry: Dict[str, Any] = {"date": date_str}
+                        last_night = _hrv_last_night_avg_ms(hrv_summary)
+                        weekly_avg = hrv_summary.get("weeklyAvg")
+                        hrv_status = hrv_summary.get("status")
+                        feedback = hrv_summary.get("feedbackPhrase")
+                        high_hrv = hrv_summary.get("lastNight5MinHigh")
+                        if last_night is not None:
+                            entry["last_night_avg_hrv_ms"] = last_night
+                        if weekly_avg is not None:
+                            entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
+                        if high_hrv is not None:
+                            entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
+                        if hrv_status:
+                            entry["status"] = hrv_status
+                        if feedback:
+                            entry["feedback"] = feedback
+                        if len(entry) > 1:
+                            trend.append(entry)
+                            available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         hrv_values = [
@@ -1322,6 +1463,10 @@ def register_tools(app):
             "running": [],
             "cycling": [],
         }
+        stale_histories: Dict[str, List[Dict[str, str]]] = {
+            "running": [],
+            "cycling": [],
+        }
         failures: List[Dict[str, str]] = []
         stale: List[Dict[str, str]] = []
         source_failures: List[Dict[str, str]] = []
@@ -1357,7 +1502,7 @@ def register_tools(app):
             else:
                 method_names = ("get_training_status", "get_max_metrics")
 
-            pending_stale: Optional[Dict[str, str]] = None
+            pending_stale: Dict[str, Dict[str, str]] = {}
             for method_name in method_names:
                 method = getattr(garmin_client, method_name, None)
                 if not callable(method):
@@ -1371,19 +1516,22 @@ def register_tools(app):
                         "source": method_name,
                     })
                     continue
+                raw_measurements = _extract_vo2_measurements(payload)
                 day_measurements = _vo2_measurements_for_date(payload, date_str)
+                for sport in raw_measurements:
+                    stale_item = _stale_observation(
+                        date_str, _vo2_observed_date(payload, sport)
+                    )
+                    if stale_item:
+                        pending_stale[sport] = stale_item
+                    elif sport in day_measurements:
+                        pending_stale.pop(sport, None)
                 if not day_measurements:
-                    for sport in _extract_vo2_measurements(payload):
-                        stale_item = _stale_observation(
-                            date_str, _vo2_observed_date(payload, sport)
-                        )
-                        if stale_item:
-                            pending_stale = stale_item
-                            break
                     continue
                 measurements = day_measurements
                 source = method_name
-                pending_stale = None
+                for sport in measurements:
+                    pending_stale.pop(sport, None)
                 break
 
             if measurements:
@@ -1395,8 +1543,8 @@ def register_tools(app):
                             "source": source,
                         }
                     )
-            elif pending_stale:
-                stale.append(pending_stale)
+            for sport, stale_item in pending_stale.items():
+                stale_histories[sport].append(stale_item)
             current += datetime.timedelta(days=1)
 
         selected_sport = None
@@ -1409,6 +1557,15 @@ def register_tools(app):
                     sport == "running",
                 ),
             )
+
+        if selected_sport is not None:
+            stale = stale_histories[selected_sport]
+        else:
+            stale = [
+                item
+                for sport in ("running", "cycling")
+                for item in stale_histories[sport]
+            ]
 
         trend = []
         last_vo2 = None
@@ -1510,28 +1667,34 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                stale_item = _stale_observation(
-                    date_str, payload.get("calendarDate")
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
-                    entry: Dict[str, Any] = {"date": date_str}
-                    avg_waking = payload.get("avgWakingRespirationValue")
-                    avg_sleep = payload.get("avgSleepRespirationValue")
-                    high_sleep = payload.get("highestRespirationValue")
-                    low_sleep = payload.get("lowestRespirationValue")
-                    if avg_waking is not None:
-                        entry["avg_waking_breaths_per_min"] = round(avg_waking, 1)
-                    if avg_sleep is not None:
-                        entry["avg_sleep_breaths_per_min"] = round(avg_sleep, 1)
-                    if high_sleep is not None:
-                        entry["highest_breaths_per_min"] = round(high_sleep, 1)
-                    if low_sleep is not None:
-                        entry["lowest_breaths_per_min"] = round(low_sleep, 1)
-                    if len(entry) > 1:
-                        trend.append(entry)
-                        available_dates.add(date_str)
+                try:
+                    stale_item = _stale_observation(
+                        date_str, payload.get("calendarDate")
+                    )
+                    if stale_item:
+                        stale.append(stale_item)
+                    else:
+                        entry: Dict[str, Any] = {"date": date_str}
+                        avg_waking = payload.get("avgWakingRespirationValue")
+                        avg_sleep = payload.get("avgSleepRespirationValue")
+                        high_sleep = payload.get("highestRespirationValue")
+                        low_sleep = payload.get("lowestRespirationValue")
+                        if avg_waking is not None:
+                            entry["avg_waking_breaths_per_min"] = round(avg_waking, 1)
+                        if avg_sleep is not None:
+                            entry["avg_sleep_breaths_per_min"] = round(avg_sleep, 1)
+                        if high_sleep is not None:
+                            entry["highest_breaths_per_min"] = round(high_sleep, 1)
+                        if low_sleep is not None:
+                            entry["lowest_breaths_per_min"] = round(low_sleep, 1)
+                        if len(entry) > 1:
+                            trend.append(entry)
+                            available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         sleep_values = [
