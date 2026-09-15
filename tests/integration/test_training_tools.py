@@ -210,6 +210,41 @@ async def test_get_running_tolerance_empty_is_not_zero(app_with_training, mock_g
 
 
 @pytest.mark.asyncio
+async def test_get_running_tolerance_classifies_auth_failure(app_with_training, mock_garmin_client):
+    mock_garmin_client.get_running_tolerance.side_effect = (
+        GarminConnectAuthenticationError("expired")
+    )
+    result = await app_with_training.call_tool(
+        "get_running_tolerance",
+        {"start_date": "2026-03-11", "end_date": "2026-03-18"},
+    )
+    data = json.loads(result[0][0].text)
+    assert data["no_data"] is False
+    assert data["failure"]["kind"] == "authentication"
+    assert data["coverage"]["failures"] == ["authentication"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_date", "end_date"),
+    [
+        ("2026-99-99", "2026-03-18"),
+        ("2026-03-19", "2026-03-18"),
+    ],
+)
+async def test_get_running_tolerance_rejects_invalid_window(
+    app_with_training, mock_garmin_client, start_date, end_date
+):
+    result = await app_with_training.call_tool(
+        "get_running_tolerance",
+        {"start_date": start_date, "end_date": end_date},
+    )
+    data = json.loads(result[0][0].text)
+    assert data["failure"]["kind"] == "validation"
+    mock_garmin_client.get_running_tolerance.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_get_training_effect_tool(app_with_training, mock_garmin_client):
     """Test get_training_effect tool"""
     # Setup mock - get_training_effect uses get_activity internally

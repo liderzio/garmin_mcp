@@ -24,8 +24,14 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _validate_date(value: str, field: str = "date") -> str:
-    if not _DATE_RE.match(value):
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
         raise ValueError(f"Invalid {field} '{value}': expected YYYY-MM-DD")
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {field} '{value}': expected a real YYYY-MM-DD date"
+        ) from exc
     return value
 
 
@@ -661,6 +667,8 @@ def register_tools(app):
         try:
             _validate_date(start_date, "start_date")
             _validate_date(end_date, "end_date")
+            if end_date < start_date:
+                raise ValueError("end_date must be on or after start_date")
             if aggregation not in ("daily", "weekly"):
                 raise ValueError(
                     f"invalid aggregation '{aggregation}', must be 'daily' or 'weekly'"
@@ -699,8 +707,45 @@ def register_tools(app):
                 "score_does_not_authorize": True,
             }
             return json.dumps(curated, indent=2)
+        except ValueError as e:
+            return json.dumps(
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "aggregation": aggregation,
+                    "count": 0,
+                    "observations": [],
+                    "coverage": {
+                        "available_dates": [],
+                        "failures": ["validation"],
+                        "filled_with_zero": False,
+                    },
+                    "no_data": False,
+                    "failure": {"kind": "validation", "message": str(e)},
+                    "score_does_not_authorize": True,
+                },
+                indent=2,
+            )
         except Exception as e:
-            return f"Error retrieving running tolerance: {str(e)}"
+            kind = _classify_garmin_failure(e)
+            return json.dumps(
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "aggregation": aggregation,
+                    "count": 0,
+                    "observations": [],
+                    "coverage": {
+                        "available_dates": [],
+                        "failures": [kind],
+                        "filled_with_zero": False,
+                    },
+                    "no_data": False,
+                    "failure": {"kind": kind, "message": str(e)},
+                    "score_does_not_authorize": True,
+                },
+                indent=2,
+            )
 
     @app.tool()
     async def get_training_effect(activity_id: int) -> str:
