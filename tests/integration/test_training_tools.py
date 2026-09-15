@@ -1413,6 +1413,59 @@ async def test_vo2max_trend_keeps_stale_selected_sport_with_current_other_sport(
 
 
 @pytest.mark.asyncio
+async def test_vo2max_trend_filters_dates_independently_by_sport(
+    app_with_training, mock_garmin_client
+):
+    mock_garmin_client.garmin_connect_metrics_url = None
+    mock_garmin_client.get_training_status.return_value = {}
+    mock_garmin_client.get_max_metrics.return_value = {
+        "generic": {"vo2MaxValue": 48.0},
+        "cycling": {"calendarDate": "2024-01-14", "vo2MaxValue": 55.0},
+    }
+
+    data = _tool_json(
+        await app_with_training.call_tool(
+            "get_vo2max_trend",
+            {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+        )
+    )
+
+    assert data["sport"] == "running"
+    assert data["trend"][0]["vo2_max"] == 48.0
+    assert data["coverage"]["available"] == 1
+
+
+@pytest.mark.asyncio
+async def test_vo2max_trend_reports_stale_list_response(
+    app_with_training, mock_garmin_client
+):
+    mock_garmin_client.garmin_connect_metrics_url = None
+    mock_garmin_client.get_training_status.return_value = {}
+    mock_garmin_client.get_max_metrics.return_value = [
+        {
+            "generic": {
+                "calendarDate": "2024-01-14",
+                "vo2MaxValue": 48.0,
+            }
+        }
+    ]
+    mock_garmin_client.get_user_profile.return_value = {}
+
+    data = _tool_json(
+        await app_with_training.call_tool(
+            "get_vo2max_trend",
+            {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+        )
+    )
+
+    assert data["coverage"]["missing"] == 0
+    assert data["coverage"]["stale"] == 1
+    assert data["stale"] == [
+        {"requested_date": "2024-01-15", "observed_date": "2024-01-14"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_trends_isolate_malformed_days_during_payload_processing(
     app_with_training, mock_garmin_client
 ):

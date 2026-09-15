@@ -237,6 +237,14 @@ def _select_primary_device(
 
 def _vo2_observed_date(data: Any, sport: str) -> Optional[str]:
     """calendarDate for a sport's VO2 sample, if Garmin provided one."""
+    if isinstance(data, list):
+        for item in data:
+            if sport not in _extract_vo2_measurements(item):
+                continue
+            observed = _vo2_observed_date(item, sport)
+            if observed:
+                return observed
+        return None
     payload = _as_dict(data)
     section_name = "generic" if sport == "running" else "cycling"
     candidates = (
@@ -255,14 +263,15 @@ def _vo2_observed_date(data: Any, sport: str) -> Optional[str]:
 def _vo2_measurements_for_date(data: Any, requested_date: str) -> Dict[str, float]:
     """VO2 samples that belong to requested_date; stale dated points are omitted."""
     dated = _extract_dated_vo2_measurements(data)
-    if requested_date in dated:
-        return dated[requested_date]
-    if dated:
-        return {}
-
     measurements: Dict[str, float] = {}
     for sport, value in _extract_vo2_measurements(data).items():
-        if _date_belongs_to_request(_vo2_observed_date(data, sport), requested_date):
+        requested_value = dated.get(requested_date, {}).get(sport)
+        sport_has_dated_value = any(sport in by_sport for by_sport in dated.values())
+        if requested_value is not None:
+            measurements[sport] = requested_value
+        elif not sport_has_dated_value and _date_belongs_to_request(
+            _vo2_observed_date(data, sport), requested_date
+        ):
             measurements[sport] = value
     return measurements
 
