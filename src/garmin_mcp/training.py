@@ -224,7 +224,7 @@ def _select_primary_device(
     fallback_key: Any = None
     fallback: Dict[str, Any] = {}
     for device_key, dev_data in mapping.items():
-        if not isinstance(dev_data, dict):
+        if not isinstance(dev_data, dict) or not dev_data:
             continue
         if fallback_key is None:
             fallback_key, fallback = device_key, dev_data
@@ -442,7 +442,7 @@ def register_tools(app):
             if isinstance(summary_data, list) and len(summary_data) > 0:
                 data = summary_data[0]
             else:
-                return f"Unexpected response format from API"
+                return "Unexpected response format from API"
 
             # Curate to essential fields only
             curated = {
@@ -1193,29 +1193,37 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                recent_status = payload.get("mostRecentTrainingStatus") or {}
-                latest_data = recent_status.get("latestTrainingStatusData") or {}
-                device_id, status_data = _select_primary_device(latest_data)
-                stale_item = _stale_observation(
-                    date_str, status_data.get("calendarDate"), device_id
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
-                    vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
-                        "generic"
-                    ) or {}
-                    vo2_data = _as_dict(vo2_data)
-                    vo2_stale = _stale_observation(date_str, vo2_data.get("calendarDate"))
-                    if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
-                        stale.append({**vo2_stale, "metric": "vo2_max"})
-                        vo2_data = {}
-                    entry = _training_load_entry(
-                        date_str, status_data, vo2_data, device_id
+                try:
+                    recent_status = payload.get("mostRecentTrainingStatus") or {}
+                    latest_data = recent_status.get("latestTrainingStatusData") or {}
+                    device_id, status_data = _select_primary_device(latest_data)
+                    stale_item = _stale_observation(
+                        date_str, status_data.get("calendarDate"), device_id
                     )
-                    if entry is not None:
-                        trend.append(entry)
-                        available_dates.add(date_str)
+                    if stale_item:
+                        stale.append(stale_item)
+                    else:
+                        vo2_data = (payload.get("mostRecentVO2Max") or {}).get(
+                            "generic"
+                        ) or {}
+                        vo2_data = _as_dict(vo2_data)
+                        vo2_stale = _stale_observation(
+                            date_str, vo2_data.get("calendarDate")
+                        )
+                        if vo2_stale and vo2_data.get("vo2MaxValue") is not None:
+                            stale.append({**vo2_stale, "metric": "vo2_max"})
+                            vo2_data = {}
+                        entry = _training_load_entry(
+                            date_str, status_data, vo2_data, device_id
+                        )
+                        if entry is not None:
+                            trend.append(entry)
+                            available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         return _trend_envelope(
@@ -1355,32 +1363,38 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                hrv_summary = _as_dict(payload.get("hrvSummary"))
-                stale_item = _stale_observation(
-                    date_str, hrv_summary.get("calendarDate")
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
-                    entry: Dict[str, Any] = {"date": date_str}
-                    last_night = _hrv_last_night_avg_ms(hrv_summary)
-                    weekly_avg = hrv_summary.get("weeklyAvg")
-                    hrv_status = hrv_summary.get("status")
-                    feedback = hrv_summary.get("feedbackPhrase")
-                    high_hrv = hrv_summary.get("lastNight5MinHigh")
-                    if last_night is not None:
-                        entry["last_night_avg_hrv_ms"] = last_night
-                    if weekly_avg is not None:
-                        entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
-                    if high_hrv is not None:
-                        entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
-                    if hrv_status:
-                        entry["status"] = hrv_status
-                    if feedback:
-                        entry["feedback"] = feedback
-                    if len(entry) > 1:
-                        trend.append(entry)
-                        available_dates.add(date_str)
+                try:
+                    hrv_summary = _as_dict(payload.get("hrvSummary"))
+                    stale_item = _stale_observation(
+                        date_str, hrv_summary.get("calendarDate")
+                    )
+                    if stale_item:
+                        stale.append(stale_item)
+                    else:
+                        entry: Dict[str, Any] = {"date": date_str}
+                        last_night = _hrv_last_night_avg_ms(hrv_summary)
+                        weekly_avg = hrv_summary.get("weeklyAvg")
+                        hrv_status = hrv_summary.get("status")
+                        feedback = hrv_summary.get("feedbackPhrase")
+                        high_hrv = hrv_summary.get("lastNight5MinHigh")
+                        if last_night is not None:
+                            entry["last_night_avg_hrv_ms"] = last_night
+                        if weekly_avg is not None:
+                            entry["weekly_avg_hrv_ms"] = round(weekly_avg, 1)
+                        if high_hrv is not None:
+                            entry["last_night_5min_high_hrv_ms"] = round(high_hrv, 1)
+                        if hrv_status:
+                            entry["status"] = hrv_status
+                        if feedback:
+                            entry["feedback"] = feedback
+                        if len(entry) > 1:
+                            trend.append(entry)
+                            available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         hrv_values = [
@@ -1439,6 +1453,10 @@ def register_tools(app):
             "running": [],
             "cycling": [],
         }
+        stale_histories: Dict[str, List[Dict[str, str]]] = {
+            "running": [],
+            "cycling": [],
+        }
         failures: List[Dict[str, str]] = []
         stale: List[Dict[str, str]] = []
         source_failures: List[Dict[str, str]] = []
@@ -1474,7 +1492,7 @@ def register_tools(app):
             else:
                 method_names = ("get_training_status", "get_max_metrics")
 
-            pending_stale: Optional[Dict[str, str]] = None
+            pending_stale: Dict[str, Dict[str, str]] = {}
             for method_name in method_names:
                 method = getattr(garmin_client, method_name, None)
                 if not callable(method):
@@ -1488,19 +1506,22 @@ def register_tools(app):
                         "source": method_name,
                     })
                     continue
+                raw_measurements = _extract_vo2_measurements(payload)
                 day_measurements = _vo2_measurements_for_date(payload, date_str)
+                for sport in raw_measurements:
+                    stale_item = _stale_observation(
+                        date_str, _vo2_observed_date(payload, sport)
+                    )
+                    if stale_item:
+                        pending_stale[sport] = stale_item
+                    elif sport in day_measurements:
+                        pending_stale.pop(sport, None)
                 if not day_measurements:
-                    for sport in _extract_vo2_measurements(payload):
-                        stale_item = _stale_observation(
-                            date_str, _vo2_observed_date(payload, sport)
-                        )
-                        if stale_item:
-                            pending_stale = stale_item
-                            break
                     continue
                 measurements = day_measurements
                 source = method_name
-                pending_stale = None
+                for sport in measurements:
+                    pending_stale.pop(sport, None)
                 break
 
             if measurements:
@@ -1512,8 +1533,8 @@ def register_tools(app):
                             "source": source,
                         }
                     )
-            elif pending_stale:
-                stale.append(pending_stale)
+            for sport, stale_item in pending_stale.items():
+                stale_histories[sport].append(stale_item)
             current += datetime.timedelta(days=1)
 
         selected_sport = None
@@ -1526,6 +1547,15 @@ def register_tools(app):
                     sport == "running",
                 ),
             )
+
+        if selected_sport is not None:
+            stale = stale_histories[selected_sport]
+        else:
+            stale = [
+                item
+                for sport in ("running", "cycling")
+                for item in stale_histories[sport]
+            ]
 
         trend = []
         last_vo2 = None
@@ -1627,28 +1657,34 @@ def register_tools(app):
             if status == "failed":
                 failures.append({"date": date_str, "kind": payload})
             elif status == "ok":
-                stale_item = _stale_observation(
-                    date_str, payload.get("calendarDate")
-                )
-                if stale_item:
-                    stale.append(stale_item)
-                else:
-                    entry: Dict[str, Any] = {"date": date_str}
-                    avg_waking = payload.get("avgWakingRespirationValue")
-                    avg_sleep = payload.get("avgSleepRespirationValue")
-                    high_sleep = payload.get("highestRespirationValue")
-                    low_sleep = payload.get("lowestRespirationValue")
-                    if avg_waking is not None:
-                        entry["avg_waking_breaths_per_min"] = round(avg_waking, 1)
-                    if avg_sleep is not None:
-                        entry["avg_sleep_breaths_per_min"] = round(avg_sleep, 1)
-                    if high_sleep is not None:
-                        entry["highest_breaths_per_min"] = round(high_sleep, 1)
-                    if low_sleep is not None:
-                        entry["lowest_breaths_per_min"] = round(low_sleep, 1)
-                    if len(entry) > 1:
-                        trend.append(entry)
-                        available_dates.add(date_str)
+                try:
+                    stale_item = _stale_observation(
+                        date_str, payload.get("calendarDate")
+                    )
+                    if stale_item:
+                        stale.append(stale_item)
+                    else:
+                        entry: Dict[str, Any] = {"date": date_str}
+                        avg_waking = payload.get("avgWakingRespirationValue")
+                        avg_sleep = payload.get("avgSleepRespirationValue")
+                        high_sleep = payload.get("highestRespirationValue")
+                        low_sleep = payload.get("lowestRespirationValue")
+                        if avg_waking is not None:
+                            entry["avg_waking_breaths_per_min"] = round(avg_waking, 1)
+                        if avg_sleep is not None:
+                            entry["avg_sleep_breaths_per_min"] = round(avg_sleep, 1)
+                        if high_sleep is not None:
+                            entry["highest_breaths_per_min"] = round(high_sleep, 1)
+                        if low_sleep is not None:
+                            entry["lowest_breaths_per_min"] = round(low_sleep, 1)
+                        if len(entry) > 1:
+                            trend.append(entry)
+                            available_dates.add(date_str)
+                except Exception as exc:
+                    failures.append({
+                        "date": date_str,
+                        "kind": _classify_garmin_failure(exc),
+                    })
             current += datetime.timedelta(days=1)
 
         sleep_values = [

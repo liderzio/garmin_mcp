@@ -4,7 +4,6 @@ Integration tests for training module MCP tools
 Tests training tools using FastMCP integration with mocked Garmin API responses.
 """
 import pytest
-from unittest.mock import Mock
 from mcp.server.fastmcp import FastMCP
 
 import json
@@ -1124,6 +1123,36 @@ async def test_training_load_trend_selects_primary_device_without_relabeling_sta
     ]
 
 
+@pytest.mark.asyncio
+async def test_training_load_uses_first_nonempty_device_as_fallback(
+    app_with_training, mock_garmin_client
+):
+    payload = _training_status("2024-01-15")
+    payload["mostRecentTrainingStatus"]["latestTrainingStatusData"] = {
+        "empty": {},
+        "watch": {
+            "calendarDate": "2024-01-15",
+            "deviceId": "watch",
+            "acuteTrainingLoadDTO": {
+                "dailyTrainingLoadAcute": 250,
+                "dailyTrainingLoadChronic": 220,
+            },
+        },
+    }
+    mock_garmin_client.get_training_status.return_value = payload
+
+    data = _tool_json(
+        await app_with_training.call_tool(
+            "get_training_load_trend",
+            {"start_date": "2024-01-15", "end_date": "2024-01-15"},
+        )
+    )
+
+    assert data["coverage"]["available"] == 1
+    assert data["trend"][0]["device_id"] == "watch"
+    assert data["trend"][0]["atl"] == 250.0
+
+
 def _respiration(calendar_date, *, sleep=13.0, waking=14.0):
     return {
         "calendarDate": calendar_date,
@@ -1336,6 +1365,98 @@ async def test_vo2max_trend_classifies_daily_failures(
     assert data["trend"][0]["vo2_max"] == 48.0
     assert data["failures"] == [{"date": "2024-01-15", "kind": "rate_limit", "source": "get_training_status"}]
     mock_garmin_client.get_user_profile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_vo2max_trend_keeps_stale_selected_sport_with_current_other_sport(
+    app_with_training, mock_garmin_client
+):
+    mock_garmin_client.garmin_connect_metrics_url = None
+    mock_garmin_client.get_max_metrics = None
+    mock_garmin_client.get_training_status.side_effect = [
+        {
+            "mostRecentVO2Max": {
+                "generic": {"calendarDate": "2024-01-14", "vo2MaxValue": 48.0}
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {"calendarDate": "2024-01-14", "vo2MaxValue": 48.0},
+                "cycling": {"calendarDate": "2024-01-15", "vo2MaxValue": 55.0},
+            }
+        },
+        {
+            "mostRecentVO2Max": {
+                "generic": {"calendarDate": "2024-01-16", "vo2MaxValue": 49.0}
+            }
+        },
+    ]
+
+    data = _tool_json(
+        await app_with_training.call_tool(
+            "get_vo2max_trend",
+            {"start_date": "2024-01-14", "end_date": "2024-01-16"},
+        )
+    )
+
+    assert data["sport"] == "running"
+    assert data["coverage"] == {
+        "requested": 3,
+        "available": 2,
+        "missing": 0,
+        "failed": 0,
+        "stale": 1,
+    }
+    assert data["stale"] == [
+        {"requested_date": "2024-01-15", "observed_date": "2024-01-14"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trends_isolate_malformed_days_during_payload_processing(
+    app_with_training, mock_garmin_client
+):
+    mock_garmin_client.get_hrv_data.side_effect = [
+        _hrv_payload(48, calendar_date="2024-01-14", weekly_avg="N/A"),
+        _hrv_payload(49, calendar_date="2024-01-15", weekly_avg=46),
+    ]
+    hrv = _tool_json(
+        await app_with_training.call_tool(
+            "get_hrv_trend",
+            {"start_date": "2024-01-14", "end_date": "2024-01-15"},
+        )
+    )
+    assert hrv["coverage"]["available"] == 1
+    assert hrv["failures"] == [{"date": "2024-01-14", "kind": "connection"}]
+
+    malformed_load = _training_status("2024-01-14", atl="bad", ctl=220)
+    mock_garmin_client.get_training_status.side_effect = [
+        malformed_load,
+        _training_status("2024-01-15", atl=250, ctl=220),
+    ]
+    load = _tool_json(
+        await app_with_training.call_tool(
+            "get_training_load_trend",
+            {"start_date": "2024-01-14", "end_date": "2024-01-15"},
+        )
+    )
+    assert load["coverage"]["available"] == 1
+    assert load["failures"] == [{"date": "2024-01-14", "kind": "connection"}]
+
+    mock_garmin_client.get_respiration_data.side_effect = [
+        _respiration("2024-01-14", sleep="bad"),
+        _respiration("2024-01-15", sleep=13.0),
+    ]
+    respiration = _tool_json(
+        await app_with_training.call_tool(
+            "get_respiration_trend",
+            {"start_date": "2024-01-14", "end_date": "2024-01-15"},
+        )
+    )
+    assert respiration["coverage"]["available"] == 1
+    assert respiration["failures"] == [
+        {"date": "2024-01-14", "kind": "connection"}
+    ]
 
 
 @pytest.mark.asyncio
