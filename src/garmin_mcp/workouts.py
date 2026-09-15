@@ -455,6 +455,8 @@ def _curate_workout_step(step: dict) -> dict:
     # Repeat info for repeat steps
     if step.get('type') == 'RepeatGroupDTO':
         curated['repeat_count'] = step.get('numberOfIterations')
+        if step.get('skipLastRestStep') is not None:
+            curated['skip_last_rest_step'] = step.get('skipLastRestStep')
         nested_steps = step.get('workoutSteps', [])
         if nested_steps:
             curated['steps'] = [_curate_workout_step(s) for s in nested_steps]
